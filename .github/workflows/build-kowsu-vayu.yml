@@ -1,0 +1,151 @@
+name: Build NEON Vayu Kernel with KowSU (Universal KSU)
+
+# Cara pakai:
+# 1. Taruh file ini di repo fork kamu, di path: .github/workflows/build-kowsu-vayu.yml
+# 2. Buka tab "Actions" di GitHub repo kamu, pilih workflow ini, klik "Run workflow"
+# 3. Tunggu ±30-90 menit, lalu download hasil zip di bagian "Artifacts"
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Nama defconfig (cek di arch/arm64/configs/, biasanya vayu_defconfig)"
+        required: true
+        default: "vayu_defconfig"
+      ksu_variant:
+        description: "Varian yang mau diintegrasikan (main = universal, support KowSU dkk)"
+        required: true
+        default: "main"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            build-essential python3 python2 cpio rsync kmod \
+            git curl zip unzip ccache \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            device-tree-compiler
+
+      - name: Setup ccache
+        run: |
+          export USE_CCACHE=1
+          export CCACHE_DIR=~/.ccache
+          ccache -M 5G
+
+      - name: Download Neutron Clang toolchain
+        run: |
+          mkdir -p clang
+          cd clang
+          curl -LO https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman
+          chmod +x antman
+          ./antman -S
+          echo "$(pwd)/bin" >> $GITHUB_PATH
+
+      - name: Integrate universal KernelSU driver (supports KowSU)
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/Ghnkz/KernelSU/refs/heads/main/kernel/setup.sh" | bash -s ${{ github.event.inputs.ksu_variant }}
+
+      - name: Locate defconfig
+        id: findconf
+        run: |
+          DEF="${{ github.event.inputs.defconfig }}"
+          if [ ! -f "arch/arm64/configs/$DEF" ]; then
+            echo "Defconfig '$DEF' tidak ditemukan, daftar yang tersedia:"
+            ls arch/arm64/configs/ | grep -i vayu || ls arch/arm64/configs/
+            exit 1
+          fi
+          echo "path=arch/arm64/configs/$DEF" >> $GITHUB_OUTPUT
+
+      - name: Patch defconfig for KernelSU/KowSU (syscall hook method)
+        run: |
+          CONF="${{ steps.findconf.outputs.path }}"
+          # Nonaktifkan KPROBES supaya pakai metode syscall-table (lebih stabil utk kernel lama)
+          sed -i '/CONFIG_KPROBES=y/d' "$CONF"
+          echo "CONFIG_KPROBES=n" >> "$CONF"
+          # Aktifkan KSU + varian syscall table + SUSFS
+          grep -q "CONFIG_KSU=y" "$CONF" || echo "CONFIG_KSU=y" >> "$CONF"
+          grep -q "CONFIG_KSU_TAMPER_SYSCALL_TABLE=y" "$CONF" || echo "CONFIG_KSU_TAMPER_SYSCALL_TABLE=y" >> "$CONF"
+          grep -q "CONFIG_KSU_SUSFS=y" "$CONF" || echo "CONFIG_KSU_SUSFS=y" >> "$CONF"
+          grep -q "CONFIG_KSU_EXTRAS=y" "$CONF" || echo "CONFIG_KSU_EXTRAS=y" >> "$CONF"
+          echo "--- Isi akhir defconfig (bagian KSU) ---"
+          grep -i ksu "$CONF"
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER=kynos
+          export KBUILD_BUILD_HOST=github-actions
+          export PATH="$(pwd)/clang/bin:$PATH"
+          export USE_CCACHE=1
+          export CCACHE_DIR=~/.ccache
+
+          make O=out ARCH=arm64 CC="ccache clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            ${{ github.event.inputs.defconfig }}
+
+          make -j$(nproc) O=out ARCH=arm64 CC="ccache clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            2>&1 | tee build.log
+
+      - name: Upload build log (selalu, buat debugging kalau gagal)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AK3
+          rm -rf AK3/.git AK3/anykernel.sh AK3/Image* AK3/*.img
+          cp out/arch/arm64/boot/Image AK3/Image
+          find out -name "*.dtb" -exec cat {} + > AK3/dtb.img 2>/dev/null || true
+          [ -f out/arch/arm64/boot/dtbo.img ] && cp out/arch/arm64/boot/dtbo.img AK3/dtbo.img || true
+          cat > AK3/anykernel.sh << 'EOF'
+### AnyKernel3 Ramdisk Mod Script
+## osm0sis @ xda-developers
+properties() { '
+kernel.string=NEON-R14 + KowSU (auto-patched)
+do.devicecheck=0
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+'; }
+boot_attributes() {
+set_perm_recursive 0 0 755 644 $ramdisk/*;
+set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin;
+}
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=0;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+. tools/ak3-core.sh;
+dump_boot;
+write_boot;
+EOF
+          cd AK3
+          zip -r9 ../NEON-R14-KowSU-A16.zip . -x ".git*"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEON-R14-KowSU-A16
+          path: NEON-R14-KowSU-A16.zip
+          
